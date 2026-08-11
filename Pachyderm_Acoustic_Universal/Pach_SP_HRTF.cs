@@ -1,6 +1,7 @@
 using SphericalVoronoiLib;
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using Vector = Hare.Geometry.Vector;
@@ -11,6 +12,18 @@ namespace Pachyderm_Acoustic
     {
         public partial class Pach_SP_HRTF
         {
+            public struct DirectionalGain
+            {
+                public int Index;
+                public double Gain;
+
+                public DirectionalGain(int index, double gain)
+                {
+                    Index = index;
+                    Gain = gain;
+                }
+            }
+
             public static double ComputeTotalEnergy(double[][][] HRIRs)
             {
                 double totalEnergy = 0.0;
@@ -260,6 +273,131 @@ namespace Pachyderm_Acoustic
                 return s;
             }
 
+            public static List<DirectionalGain> VbapGains(Vector target, Vector[] directions, int candidateCount = 24)
+            {
+                var result = new List<DirectionalGain>();
+                if (directions == null || directions.Length == 0) return result;
+
+                target.Normalize();
+
+                int nearest = 0;
+                double nearestDot = double.NegativeInfinity;
+                for (int i = 0; i < directions.Length; i++)
+                {
+                    double dot = Dot(target, directions[i]);
+                    if (dot > nearestDot)
+                    {
+                        nearestDot = dot;
+                        nearest = i;
+                    }
+                }
+
+                if (nearestDot > 0.999999999)
+                {
+                    result.Add(new DirectionalGain(nearest, 1.0));
+                    return result;
+                }
+
+                int[] candidates = Enumerable.Range(0, directions.Length)
+                    .OrderByDescending(i => Dot(target, directions[i]))
+                    .Take(Math.Min(candidateCount, directions.Length))
+                    .ToArray();
+
+                double bestScore = double.MaxValue;
+                int bestA = -1, bestB = -1, bestC = -1;
+                double bestG0 = 0, bestG1 = 0, bestG2 = 0;
+
+                for (int a = 0; a < candidates.Length - 2; a++)
+                {
+                    for (int b = a + 1; b < candidates.Length - 1; b++)
+                    {
+                        for (int c = b + 1; c < candidates.Length; c++)
+                        {
+                            int ia = candidates[a];
+                            int ib = candidates[b];
+                            int ic = candidates[c];
+
+                            double g0, g1, g2;
+                            if (!SolveVectorBase(directions[ia], directions[ib], directions[ic], target, out g0, out g1, out g2))
+                                continue;
+
+                            const double eps = -1e-8;
+                            if (g0 < eps || g1 < eps || g2 < eps) continue;
+
+                            if (g0 < 0) g0 = 0;
+                            if (g1 < 0) g1 = 0;
+                            if (g2 < 0) g2 = 0;
+
+                            double norm = Math.Sqrt(g0 * g0 + g1 * g1 + g2 * g2);
+                            if (norm <= 1e-12) continue;
+
+                            g0 /= norm;
+                            g1 /= norm;
+                            g2 /= norm;
+
+                            Vector reconstructed = directions[ia] * g0 + directions[ib] * g1 + directions[ic] * g2;
+                            reconstructed.Normalize();
+                            double error = (reconstructed - target).Length();
+                            double spreadPenalty = 0.001 * ((1.0 - Dot(target, directions[ia])) + (1.0 - Dot(target, directions[ib])) + (1.0 - Dot(target, directions[ic])));
+                            double score = error + spreadPenalty;
+
+                            if (score < bestScore)
+                            {
+                                bestScore = score;
+                                bestA = ia;
+                                bestB = ib;
+                                bestC = ic;
+                                bestG0 = g0;
+                                bestG1 = g1;
+                                bestG2 = g2;
+                            }
+                        }
+                    }
+                }
+
+                if (bestA >= 0)
+                {
+                    if (bestG0 > 1e-12) result.Add(new DirectionalGain(bestA, bestG0));
+                    if (bestG1 > 1e-12) result.Add(new DirectionalGain(bestB, bestG1));
+                    if (bestG2 > 1e-12) result.Add(new DirectionalGain(bestC, bestG2));
+                    return result;
+                }
+
+                result.Add(new DirectionalGain(nearest, 1.0));
+                return result;
+            }
+
+            private static bool SolveVectorBase(Vector a, Vector b, Vector c, Vector target, out double g0, out double g1, out double g2)
+            {
+                g0 = 0;
+                g1 = 0;
+                g2 = 0;
+
+                Vector bc = Cross(b, c);
+                double det = Dot(a, bc);
+                if (Math.Abs(det) < 1e-10) return false;
+
+                g0 = Dot(target, bc) / det;
+                g1 = Dot(a, Cross(target, c)) / det;
+                g2 = Dot(a, Cross(b, target)) / det;
+                return !(double.IsNaN(g0) || double.IsNaN(g1) || double.IsNaN(g2) ||
+                         double.IsInfinity(g0) || double.IsInfinity(g1) || double.IsInfinity(g2));
+            }
+
+            private static double Dot(Vector a, Vector b)
+            {
+                return a.dx * b.dx + a.dy * b.dy + a.dz * b.dz;
+            }
+
+            private static Vector Cross(Vector a, Vector b)
+            {
+                return new Vector(
+                    a.dy * b.dz - a.dz * b.dy,
+                    a.dz * b.dx - a.dx * b.dz,
+                    a.dx * b.dy - a.dy * b.dx);
+            }
+
+
             public static double[] BuildDrySignal(double[][] directionalSignals)
             {
                 int length = directionalSignals.First(s => s != null).Length;
@@ -335,23 +473,26 @@ namespace Pachyderm_Acoustic
                 if (Signal.Length != 2)
                     throw new ArgumentException("Signal must have 2 channels (stereo).");
 
-                int length = Signal[0].Length;
-                double outSumSquares = 0;
+                int leftLength = Signal[0]?.Length ?? 0;
+                int rightLength = Signal[1]?.Length ?? 0;
+                int length = Math.Max(leftLength, rightLength);
+                if (length == 0) return;
 
+                double outSumSquares = 0;
                 for (int t = 0; t < length; t++)
                 {
-                    double avgSample = 0.5 * (Signal[0][t] + Signal[1][t]);
-                    outSumSquares += avgSample * avgSample;
+                    double left = t < leftLength ? Signal[0][t] : 0.0;
+                    double right = t < rightLength ? Signal[1][t] : 0.0;
+                    outSumSquares += 0.5 * (left * left + right * right);
                 }
 
                 double outRMS = Math.Sqrt(outSumSquares / length);
                 double gainFactor = dryRMS / (outRMS + 1e-12);
 
                 for (int ch = 0; ch < 2; ch++)
-                    for (int t = 0; t < length; t++)
+                    for (int t = 0; t < Signal[ch].Length; t++)
                         Signal[ch][t] *= gainFactor;
             }
-
             private static int MirrorIndex(int idx, int len)
             {
                 while (idx < 0 || idx >= len)

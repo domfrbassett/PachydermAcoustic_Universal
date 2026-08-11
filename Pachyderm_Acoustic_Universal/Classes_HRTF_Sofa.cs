@@ -17,23 +17,17 @@ namespace Pachyderm_Acoustic
         {
             public Topology T;
             public Voxel_Grid VG;
-            Hare.Geometry.Point[][] P;
-            int Fnum = 0;
-            List<int>[] bins;
             List<Vector> emitterVectors;
             double[,] emitterdirs;
             float[][][] HRIR;
-            int[] Face_Centroid_ID;
-            Point origin;
-            Random rand = new Random();
             private int Fs;
             Vector[] PrincipalDirections;
-            double[] Azi, Alt;
 
             public bool AngularDistancePass { get; private set; }
             public bool GlobeCoveragePass { get; private set; }
             public string ValidationMessage { get; private set; }
-            public bool ValidationPassed => AngularDistancePass && GlobeCoveragePass;
+            public bool SofaCompatibilityPass { get; private set; }
+            public bool ValidationPassed => SofaCompatibilityPass;
 
             public double AvgAngularDistanceFrontal { get; private set; }
             public double AvgAngularDistanceRear { get; private set; }
@@ -41,7 +35,6 @@ namespace Pachyderm_Acoustic
 
             double[][][] Loaded_HRIR;
             double[][][] Loaded_HRIR_44100;
-            double[][] Translation;
 
             public HRTF(string SofafilePath)
             {
@@ -49,90 +42,25 @@ namespace Pachyderm_Acoustic
                 long fileId = H5F.open(SofafilePath, H5F.ACC_RDONLY);
                 if (fileId < 0)
                 {
-                    Console.WriteLine("Error opening file.");
-                    return;
+                    throw new InvalidOperationException("Error opening SOFA file.");
                 }
 
                 try
                 {
-                    // Read the SOFA Conventions attribute
                     string Conv = ReadGlobalString(fileId, "Conventions");
                     string Conv_SOFA = ReadGlobalString(fileId, "SOFAConventions");
+                    string DataType = ReadGlobalString(fileId, "DataType");
+                    ValidateSofaCompatibility(Conv, Conv_SOFA, DataType);
+
                     emitterdirs = ReadSourcePosition(fileId);
+                    if (emitterdirs == null || emitterdirs.GetLength(0) == 0)
+                        throw new InvalidOperationException("No usable SourcePosition directions were found in the SOFA file.");
+
                     Fs = ReadSamplingFrequency(fileId);
-
-                    // Tolerances for dataset validation should be treated with a pinch of salt - they are somewhat arbitrary but based on experience with a range of datasets
-
-                    AngularDistancePass = CheckHrtfAngularDistance();
-                    GlobeCoveragePass = CheckHrtfGlobeCoverage(15.0);
-
-                    AvgAngularDistanceFrontal = GetAvgAngularDistanceFrontal();
-                    AvgAngularDistanceRear = GetAvgAngularDistanceRear();
-                    MaxCoverageGap = GetMaxCoverageGap();
-
-                    if (!AngularDistancePass && !GlobeCoveragePass)
-                    {
-                        ValidationMessage = "HRTF failed both angular distance and globe coverage checks:\n" +
-                                            $"Average angular distance in front hemisphere: {AvgAngularDistanceFrontal:F2}° (tolerance: 8°)\n" +
-                                            $"Average angular distance in back hemisphere: {AvgAngularDistanceRear:F2}°";
-
-                        if (AvgAngularDistanceRear >= 150)
-                        {
-                            ValidationMessage += " (Warning: rear hemisphere appears to be effectively empty)";
-                        }
-
-                        ValidationMessage += $"\nMaximum coverage gap found: {MaxCoverageGap:F2}° (tolerance: 15°)\n" +
-                                             "For more detailed diagnostics and a visualisation of the sampling density of your .SOFA file, please see: \n" +
-                                             "https://github.com/domfrbassett/HRTF_Diagnostic_Tool";
-                    }
-                    else if (!AngularDistancePass)
-                    {
-                        ValidationMessage = "HRTF failed angular distance check.\n" +
-                                            $"Average angular distance in front hemisphere: {AvgAngularDistanceFrontal:F2}° (tolerance: 8°)\n" +
-                                            $"Average angular distance in back hemisphere: {AvgAngularDistanceRear:F2}°";
-
-                        if (AvgAngularDistanceRear >= 150)
-                        {
-                            ValidationMessage += " (Warning: rear hemisphere appears to be effectively empty)";
-                        }
-
-                        ValidationMessage += " (tolerance: 8°)\n" +
-                                             "For more detailed diagnostics and a visualisation of the sampling density of your .SOFA file, please see:\n" +
-                                             "https://github.com/domfrbassett/HRTF_Diagnostic_Tool";
-                    }
-                    else if (!GlobeCoveragePass)
-                    {
-                        ValidationMessage = "HRTF failed globe coverage check.\n" +
-                                            $"Maximum coverage gap found: {MaxCoverageGap:F2}° (tolerance: 15°)\n" +
-                                            "For more detailed diagnostics and a visualisation of the sampling density of your .SOFA file, please see: \n" +
-                                            "https://github.com/domfrbassett/HRTF_Diagnostic_Tool";
-                    }
-
-                    int order = GetRequiredSubdivisionOrder(emitterdirs.GetLength(0));
-
-                    //Create a reference sphere...
-                    VG = Pachyderm_Acoustic.Utilities.Geometry.GeoSphere(order);
-                    T = VG.Model[0];
-                    PrincipalDirections = new Vector[T.Polygon_Count];
-                    for (int i = 0; i < T.Polygon_Count; i++)
-                    {
-                        Vector d = new Vector(T.Polys[i].Centroid.x, T.Polys[i].Centroid.y, T.Polys[i].Centroid.z);
-                        d.Normalize();
-                        PrincipalDirections[i] = d;
-                    }
+                    ReadHrtfDataset(fileId, "Data.IR", emitterdirs.GetLength(0));
+                    BuildDirectionalSamplingSummary();
 
                     emitterVectors = new List<Vector>();
-                    Alt = new double[T.Polygon_Count];
-                    Azi = new double[T.Polygon_Count];
-                    bins = new List<int>[T.Polygon_Count];
-                    for (int i = 0; i < T.Polygon_Count; i++) bins[i] = new List<int>();
-
-                    Face_Centroid_ID = new int[T.Polygon_Count];
-                    for (int i = 0; i < T.Polygon_Count; i++) Face_Centroid_ID[i] = -1;
-                    double[] mindist = new double[T.Polygon_Count];
-                    for (int i = 0; i < T.Polygon_Count; i++) mindist[i] = double.MaxValue;
-
-                    origin = new Point(0, 0, 0);
                     for (int i = 0; i < emitterdirs.GetLength(0); i++)
                     {
                         double azRad = Math.PI * emitterdirs[i, 0] / 180.0;
@@ -143,49 +71,18 @@ namespace Pachyderm_Acoustic
                         Vector d = new Vector(x, y, z);
                         d.Normalize();
                         emitterVectors.Add(d);
-                        X_Event X;
-                        VG.Shoot(new Ray(origin, d, 0, rand.Next()), 0, out X);
-                        if (X.Hit)
-                        {
-                            bins[X.Poly_id].Add(i);
-                            double l = (T.Polygon_Centroid(X.Poly_id) - X.X_Point).Length();
-                            if (l < mindist[X.Poly_id])
-                            {
-                                Azi[X.Poly_id] = emitterdirs[i, 0];
-                                Alt[X.Poly_id] = emitterdirs[i, 1];
-                                mindist[X.Poly_id] = l;
-                                Face_Centroid_ID[X.Poly_id] = i;
-                            }
-                        }
                     }
-
-                    // Read HRIR data
-                    ReadHrtfDataset(fileId, "Data.IR");
 
                     var validHRIRs = new List<double[][]>();
-                    var validTranslations = new List<double[]>();
                     var validDirections = new List<Vector>();
 
-                    int validFaces = Face_Centroid_ID.Count(id => id != -1);
-                    double power = (validFaces / 2.0 - 1) / 2.0;
-
-                    for (int i = 0; i < Directions.Length; i++)
+                    for (int i = 0; i < emitterVectors.Count; i++)
                     {
-                        if (Face_Centroid_ID[i] == -1) continue;
-                        var hrir = Pach_SP_HRTF.ResampleHRIRWDL(HRIR[Face_Centroid_ID[i]], Fs, 44100);
-
-                        var trans = new double[3];
-                        trans[0] = Math.Pow(Math.Abs(Directions[i].dx), power);
-                        trans[1] = Math.Pow(Math.Abs(Directions[i].dy), power);
-                        trans[2] = Math.Pow(Math.Abs(Directions[i].dz), power);
-
-                        validHRIRs.Add(hrir);
-                        validTranslations.Add(trans);
-                        validDirections.Add(Directions[i]);
+                        validHRIRs.Add(Pach_SP_HRTF.ResampleHRIRWDL(HRIR[i], Fs, 44100));
+                        validDirections.Add(emitterVectors[i]);
                     }
 
-                    Loaded_HRIR_44100 = validHRIRs.ToArray(); // Store HRIRs resampled to 44100 Hz - useful for many applications and can be retrieved quickly
-                    Translation = validTranslations.ToArray();
+                    Loaded_HRIR_44100 = validHRIRs.ToArray(); // Store HRIRs resampled to 44100 Hz - useful for many applications and can be retrieved quickly.
                     Directions = validDirections.ToArray();
                 }
                 finally
@@ -194,22 +91,100 @@ namespace Pachyderm_Acoustic
                 }
             }
 
-            /// <summary>
-            /// This method determines the required subdivision order based on the total number of sources. This assumes a fully covered sphere, which is rarely the case with real HRTF datasets. 
-            /// However, it provides a reasonable estimate for the subdivision order needed to achieve a certain number of directions. In the future, this could be improved by analysing the actual distribution of sources in the dataset.
-            /// 
-            /// </summary>
-            /// <param name="totalSources"></param>
-            /// <returns></returns>
-            public static int GetRequiredSubdivisionOrder(int totalSources)
+            private void ValidateSofaCompatibility(string conventions, string sofaConvention, string dataType)
             {
-                if (totalSources <= 20) return 0;    // Order 0: 20 faces
-                if (totalSources <= 80) return 1;    // Order 1: 80 faces
-                if (totalSources <= 320) return 2;   // Order 2: 320 faces
-                if (totalSources <= 1280) return 3;  // Order 3: 1280 faces
-                return 4;                            // Order 4: 5120 faces
+                if (!string.Equals((conventions ?? string.Empty).Trim(), "SOFA", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("The selected file does not declare the SOFA convention.");
+
+                string conv = (sofaConvention ?? string.Empty).Trim();
+                string type = (dataType ?? string.Empty).Trim();
+
+                if (!string.IsNullOrWhiteSpace(type) && !string.Equals(type, "FIR", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException($"Unsupported SOFA data type '{type}'. Pachyderm currently expects FIR HRIR data stored in Data.IR.");
+
+                if (string.Equals(conv, "SimpleFreeFieldHRIR", StringComparison.OrdinalIgnoreCase))
+                {
+                    SofaCompatibilityPass = true;
+                    return;
+                }
+
+                if (string.Equals(conv, "GeneralFIR", StringComparison.OrdinalIgnoreCase))
+                {
+                    SofaCompatibilityPass = true;
+                    ValidationMessage = "Warning: this file uses GeneralFIR. Pachyderm will treat SourcePosition as HRTF directions and Data.IR channels 0 and 1 as ears.";
+                    return;
+                }
+
+                if (string.Equals(conv, "SimpleFreeFieldHRTF", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(conv, "FreeFieldHRTF", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException($"Unsupported SOFA convention '{conv}'. Frequency-domain HRTF conventions require Data.Real/Data.Imag conversion before Pachyderm can use them.");
+
+                if (string.Equals(conv, "SimpleFreeFieldHRSOS", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(conv, "SimpleFreeFieldSOS", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException($"Unsupported SOFA convention '{conv}'. SOS HRTF conventions must be converted to FIR HRIR data before Pachyderm can use them.");
+
+                if (string.Equals(conv, "FreeFieldHRIR", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(conv, "GeneralFIR-E", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException($"Unsupported SOFA convention '{conv}'. Emitter-dependent FIR data is not handled by this HRTF loader.");
+
+                throw new InvalidOperationException($"Unsupported SOFA convention '{(string.IsNullOrWhiteSpace(conv) ? "unknown" : conv)}'. Pachyderm currently supports SimpleFreeFieldHRIR and compatible GeneralFIR files.");
             }
 
+            private void BuildDirectionalSamplingSummary()
+            {
+                var vectors = Enumerable.Range(0, emitterdirs.GetLength(0))
+                    .Select(i => PachTools.SphericalToCartesian(emitterdirs[i, 0], emitterdirs[i, 1]))
+                    .ToArray();
+
+                var frontVectors = vectors.Where(v => v.dx >= 0).ToArray();
+                var backVectors = vectors.Where(v => v.dx < 0).ToArray();
+                AngularDistancePass = frontVectors.Length > 0 && backVectors.Length > 0;
+                AvgAngularDistanceFrontal = frontVectors.Length > 1 ? AverageMinAngularDistance(frontVectors) : 180.0;
+                AvgAngularDistanceRear = backVectors.Length > 1 ? AverageMinAngularDistance(backVectors) : 180.0;
+
+                MaxCoverageGap = EstimateMaxCoverageGap(vectors, 362);
+                bool hasUpper = emitterdirs.Cast<double>().Where((_, i) => i % 2 == 1).Any(el => el > 35.0);
+                bool hasLower = emitterdirs.Cast<double>().Where((_, i) => i % 2 == 1).Any(el => el < -35.0);
+                GlobeCoveragePass = hasUpper && hasLower && MaxCoverageGap <= 60.0;
+
+                var warnings = new List<string>();
+                if (!string.IsNullOrWhiteSpace(ValidationMessage)) warnings.Add(ValidationMessage);
+                if (vectors.Length < 24) warnings.Add("Warning: the SOFA file has very few HRTF directions; binaural rendering may be coarse.");
+                if (!AngularDistancePass) warnings.Add("Warning: SourcePosition does not cover both front and rear hemispheres.");
+                if (!hasUpper || !hasLower) warnings.Add("Warning: SourcePosition does not appear to cover both upper and lower hemispheres.");
+                if (MaxCoverageGap > 60.0) warnings.Add($"Warning: estimated maximum directional gap is {MaxCoverageGap:F1} deg; full-3D binaural rendering may be sparse.");
+
+                ValidationMessage = warnings.Count > 0 ? string.Join(System.Environment.NewLine, warnings) : string.Empty;
+            }
+
+            private static double EstimateMaxCoverageGap(Vector[] directions, int sampleCount)
+            {
+                if (directions == null || directions.Length == 0) return 180.0;
+
+                double maxGap = 0.0;
+                double goldenAngle = Math.PI * (3.0 - Math.Sqrt(5.0));
+
+                for (int i = 0; i < sampleCount; i++)
+                {
+                    double z = 1.0 - 2.0 * (i + 0.5) / sampleCount;
+                    double r = Math.Sqrt(Math.Max(0.0, 1.0 - z * z));
+                    double theta = i * goldenAngle;
+                    var sample = new Vector(Math.Cos(theta) * r, Math.Sin(theta) * r, z);
+
+                    double minAngle = directions.Min(direction => AngularDistanceDegrees(sample, direction));
+                    if (minAngle > maxGap) maxGap = minAngle;
+                }
+
+                return maxGap;
+            }
+
+            public static int GetRequiredSubdivisionOrder(int totalSources)
+            {
+                if (totalSources <= 20) return 0;
+                if (totalSources <= 80) return 1;
+                if (totalSources <= 320) return 2;
+                return 3;
+            }
             public int SampleCt
             {
                 get
@@ -222,7 +197,7 @@ namespace Pachyderm_Acoustic
             {
                 get
                 {
-                    return T.Polys.Count;
+                    return Directions == null ? 0 : Directions.Length;
                 }
             }
 
@@ -272,7 +247,7 @@ namespace Pachyderm_Acoustic
 
                 for (int elIdx = 0; elIdx < N_el; elIdx++)
                 {
-                    double el = 90.0 * elIdx / (N_el - 1);
+                    double el = -90.0 + 180.0 * elIdx / (N_el - 1);
                     for (int azIdx = 0; azIdx < N_az; azIdx++)
                     {
                         double az = 360.0 * azIdx / N_az;
@@ -388,7 +363,7 @@ namespace Pachyderm_Acoustic
 
             private double[,] ReadSourcePosition(long fileId)
             {
-                string[] candidates = { "SourcePosition", "EmitterPosition" };
+                string[] candidates = { "SourcePosition" };
 
                 foreach (var name in candidates)
                 {
@@ -411,35 +386,33 @@ namespace Pachyderm_Acoustic
                         }
 
                         ulong[] dims = new ulong[2];
-                        if (H5S.get_simple_extent_dims(spaceId, dims, null) < 0)
+                        int rank = H5S.get_simple_extent_dims(spaceId, dims, null);
+                        if (rank != 2)
                         {
-                            Console.WriteLine($"Error getting dataset dimensions for {name}.");
+                            Console.WriteLine($"Unexpected {name} rank. Expected 2D Nx3 or 3xN, got rank {rank}.");
                             continue;
                         }
 
-                        // Accept either N x 3 or 3 x N
                         bool transposed = false;
                         int numSources;
                         if (dims[1] == 3)
                         {
-                            numSources = (int)dims[0]; // N x 3
+                            numSources = (int)dims[0];
                         }
                         else if (dims[0] == 3)
                         {
-                            transposed = true; // 3 x N
+                            transposed = true;
                             numSources = (int)dims[1];
                         }
                         else
                         {
                             Console.WriteLine($"Unexpected {name} format. Expected Nx3 or 3xN, got {dims[0]}x{dims[1]}.");
-                            return null;
+                            continue;
                         }
 
-                        // Flat buffer
                         int len = numSources * 3;
                         double[] flat = new double[len];
 
-                        // Pin the flat buffer
                         GCHandle h = GCHandle.Alloc(flat, GCHandleType.Pinned);
                         try
                         {
@@ -456,26 +429,44 @@ namespace Pachyderm_Acoustic
                             h.Free();
                         }
 
-                        // Build final result [numSources, 2] (azimuth, elevation)
-                        double[,] result = new double[numSources, 2];
-                        if (!transposed)
+                        string positionType = ReadDatasetStringAttribute(fileId, name, "Type");
+                        string units = ReadDatasetStringAttribute(fileId, name, "Units");
+                        bool isCartesian = !string.IsNullOrWhiteSpace(positionType) && positionType.IndexOf("cartesian", StringComparison.OrdinalIgnoreCase) >= 0;
+                        bool isSpherical = string.IsNullOrWhiteSpace(positionType) || positionType.IndexOf("spherical", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                        if (!isSpherical && !isCartesian)
                         {
-                            for (int i = 0; i < numSources; ++i)
-                            {
-                                result[i, 0] = flat[i * 3 + 0]; // azimuth
-                                result[i, 1] = flat[i * 3 + 1]; // elevation
-                            }
+                            Console.WriteLine($"Unsupported {name}:Type '{positionType}'. Expected spherical or cartesian.");
+                            continue;
                         }
-                        else
+
+                        bool angularUnitsAreRadians = !string.IsNullOrWhiteSpace(units) && units.IndexOf("radian", StringComparison.OrdinalIgnoreCase) >= 0;
+                        double[,] result = new double[numSources, 2];
+
+                        for (int i = 0; i < numSources; ++i)
                         {
-                            for (int i = 0; i < numSources; ++i)
+                            double v0 = transposed ? flat[i] : flat[i * 3 + 0];
+                            double v1 = transposed ? flat[numSources + i] : flat[i * 3 + 1];
+                            double v2 = transposed ? flat[2 * numSources + i] : flat[i * 3 + 2];
+
+                            if (isCartesian)
                             {
-                                result[i, 0] = flat[0 * numSources + i]; // azimuth row
-                                result[i, 1] = flat[1 * numSources + i]; // elevation row
+                                double xy = Math.Sqrt(v0 * v0 + v1 * v1);
+                                double r = Math.Sqrt(v0 * v0 + v1 * v1 + v2 * v2);
+                                if (r <= 1e-12)
+                                    throw new InvalidOperationException($"{name} contains a zero-length cartesian source vector at index {i}.");
+
+                                result[i, 0] = Math.Atan2(v1, v0) * 180.0 / Math.PI;
+                                result[i, 1] = Math.Atan2(v2, xy) * 180.0 / Math.PI;
+                            }
+                            else
+                            {
+                                result[i, 0] = angularUnitsAreRadians ? v0 * 180.0 / Math.PI : v0;
+                                result[i, 1] = angularUnitsAreRadians ? v1 * 180.0 / Math.PI : v1;
                             }
                         }
 
-                        Console.WriteLine($"Read {numSources} source positions from {name}.");
+                        Console.WriteLine($"Read {numSources} source positions from {name} ({(isCartesian ? "cartesian" : "spherical")}).");
                         return result;
                     }
                     finally
@@ -485,17 +476,53 @@ namespace Pachyderm_Acoustic
                     }
                 }
 
-                Console.WriteLine("No valid SourcePosition or EmitterPosition dataset found.");
+                Console.WriteLine("No valid SourcePosition dataset found.");
                 return null;
             }
 
+            private string ReadDatasetStringAttribute(long fileId, string datasetName, string attributeName)
+            {
+                long attrId = H5A.open_by_name(fileId, datasetName, attributeName, H5P.DEFAULT, H5P.DEFAULT);
+                if (attrId < 0) return null;
+
+                try
+                {
+                    long typeId = H5A.get_type(attrId);
+                    if (typeId < 0) return null;
+
+                    try
+                    {
+                        int size = Math.Max(H5T.get_size(typeId).ToInt32(), 1);
+                        byte[] buffer = new byte[size];
+                        GCHandle pinnedArray = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+                        try
+                        {
+                            if (H5A.read(attrId, typeId, pinnedArray.AddrOfPinnedObject()) < 0)
+                                return null;
+                        }
+                        finally
+                        {
+                            pinnedArray.Free();
+                        }
+
+                        return Encoding.ASCII.GetString(buffer).TrimEnd('\0', ' ');
+                    }
+                    finally
+                    {
+                        H5T.close(typeId);
+                    }
+                }
+                finally
+                {
+                    H5A.close(attrId);
+                }
+            }
             private string ReadGlobalString(long fileId, string Field)
             {
                 // Open the attribute
                 long attrId = H5A.open_by_name(fileId, "/", Field, H5P.DEFAULT, H5P.DEFAULT);
                 if (attrId < 0)
                 {
-                    H5F.close(fileId);
                     return null;
                 }
 
@@ -504,7 +531,6 @@ namespace Pachyderm_Acoustic
                 if (typeId < 0)
                 {
                     H5A.close(attrId);
-                    H5F.close(fileId);
                     return null;
                 }
 
@@ -541,7 +567,6 @@ namespace Pachyderm_Acoustic
                 long attrId = H5A.open_by_name(fileId, "SourcePosition", "Units", H5P.DEFAULT, H5P.DEFAULT);
                 if (attrId < 0)
                 {
-                    H5F.close(fileId);
                     return null;
                 }
 
@@ -550,7 +575,6 @@ namespace Pachyderm_Acoustic
                 if (typeId < 0)
                 {
                     H5A.close(attrId);
-                    H5F.close(fileId);
                     return null;
                 }
 
@@ -600,45 +624,63 @@ namespace Pachyderm_Acoustic
                 return buffer;
             }
 
-            private void ReadHrtfDataset(long fileId, string datasetName)
+            private void ReadHrtfDataset(long fileId, string datasetName, int expectedMeasurements)
             {
                 long datasetId = H5D.open(fileId, datasetName);
                 if (datasetId < 0)
-                {
-                    Console.WriteLine($"Error opening dataset {datasetName}.");
-                    return;
-                }
+                    throw new InvalidOperationException($"The SOFA file does not contain required FIR dataset {datasetName}.");
 
                 try
                 {
                     long dataspaceId = H5D.get_space(datasetId);
-                    ulong[] dims = new ulong[3];
-                    H5S.get_simple_extent_dims(dataspaceId, dims, null);
-                    int measurements = (int)dims[0];
-                    int channels = (int)dims[1];
-                    int samples = (int)dims[2];
-
-                    float[,,] dataIR = new float[measurements, channels, samples];
-                    GCHandle handle = GCHandle.Alloc(dataIR, GCHandleType.Pinned);
                     try
                     {
-                        H5D.read(datasetId, H5T.NATIVE_FLOAT, H5S.ALL, H5S.ALL, H5P.DEFAULT, handle.AddrOfPinnedObject());
+                        int rank = H5S.get_simple_extent_ndims(dataspaceId);
+                        if (rank != 3)
+                            throw new InvalidOperationException($"Unsupported {datasetName} rank {rank}. Pachyderm expects SimpleFreeFieldHRIR-style M x R x N FIR data.");
+
+                        ulong[] dims = new ulong[3];
+                        if (H5S.get_simple_extent_dims(dataspaceId, dims, null) < 0)
+                            throw new InvalidOperationException($"Unable to read dimensions for {datasetName}.");
+
+                        int measurements = (int)dims[0];
+                        int channels = (int)dims[1];
+                        int samples = (int)dims[2];
+
+                        if (measurements != expectedMeasurements)
+                            throw new InvalidOperationException($"SourcePosition count ({expectedMeasurements}) does not match {datasetName} measurement count ({measurements}).");
+                        if (channels < 2)
+                            throw new InvalidOperationException($"{datasetName} has {channels} receiver channel(s); binaural rendering requires at least two.");
+                        if (samples <= 0)
+                            throw new InvalidOperationException($"{datasetName} contains no FIR samples.");
+
+                        float[,,] dataIR = new float[measurements, channels, samples];
+                        GCHandle handle = GCHandle.Alloc(dataIR, GCHandleType.Pinned);
+                        try
+                        {
+                            if (H5D.read(datasetId, H5T.NATIVE_FLOAT, H5S.ALL, H5S.ALL, H5P.DEFAULT, handle.AddrOfPinnedObject()) < 0)
+                                throw new InvalidOperationException($"Failed to read {datasetName}.");
+                        }
+                        finally
+                        {
+                            handle.Free();
+                        }
+
+                        HRIR = new float[measurements][][];
+                        for (int i = 0; i < measurements; i++)
+                        {
+                            HRIR[i] = new float[channels][];
+                            for (int ch = 0; ch < channels; ch++)
+                            {
+                                HRIR[i][ch] = new float[samples];
+                                for (int k = 0; k < samples; k++)
+                                    HRIR[i][ch][k] = dataIR[i, ch, k];
+                            }
+                        }
                     }
                     finally
                     {
-                        handle.Free();
-                    }
-
-                    HRIR = new float[measurements][][];
-                    for (int i = 0; i < measurements; i++)
-                    {
-                        HRIR[i] = new float[channels][];
-                        for (int ch = 0; ch < channels; ch++)
-                        {
-                            HRIR[i][ch] = new float[samples];
-                            for (int k = 0; k < samples; k++)
-                                HRIR[i][ch][k] = dataIR[i, ch, k];
-                        }
+                        H5S.close(dataspaceId);
                     }
                 }
                 finally
@@ -646,7 +688,6 @@ namespace Pachyderm_Acoustic
                     H5D.close(datasetId);
                 }
             }
-
             double[][] Loaded_Filter;
 
             public void Load(Direct_Sound Direct, ImageSourceData ISData, Pachyderm_Acoustic.Environment.Receiver_Bank RTData, SystemResponseCompensation.SystemCompensationSettings sysCompSettings, double CO_Time_ms, int targetFs, int Rec_ID, bool Start_at_Zero, bool flat, bool auto)
@@ -683,17 +724,11 @@ namespace Pachyderm_Acoustic
                         var validHRIRs = new List<double[][]>();
                         for (int i = 0; i < DirsCT; i++)
                         {
-                            int faceId = Face_Centroid_ID[i];
-                            if (faceId == -1) continue;
-                            var hrirResampled = new double[2][];
-
-                            hrirResampled = Pach_SP_HRTF.ResampleHRIRWDL(
-                                HRIR[faceId],
+                            validHRIRs.Add(Pach_SP_HRTF.ResampleHRIRWDL(
+                                HRIR[i],
                                 Fs,
                                 targetFs
-                            );
-
-                            validHRIRs.Add(hrirResampled);
+                            ));
                         }
                         Loaded_HRIR = validHRIRs.ToArray();
                     }
@@ -704,17 +739,14 @@ namespace Pachyderm_Acoustic
 
                     for (int i = 0; i < DirsCT; i++)
                     {
-                        int faceId = Face_Centroid_ID[i];
-                        if (faceId == -1) continue;
+                        var hrirCopy = new double[HRIR[i].Length][];
 
-                        var hrirCopy = new double[HRIR[faceId].Length][];
-
-                        for (int ch = 0; ch < HRIR[faceId].Length; ch++)
+                        for (int ch = 0; ch < HRIR[i].Length; ch++)
                         {
-                            hrirCopy[ch] = new double[HRIR[faceId][ch].Length];
-                            for (int k = 0; k < HRIR[faceId][ch].Length; k++)
+                            hrirCopy[ch] = new double[HRIR[i][ch].Length];
+                            for (int k = 0; k < HRIR[i][ch].Length; k++)
                             {
-                                hrirCopy[ch][k] = HRIR[faceId][ch][k];
+                                hrirCopy[ch][k] = HRIR[i][ch][k];
                             }
                         }
 
@@ -724,42 +756,71 @@ namespace Pachyderm_Acoustic
                     Loaded_HRIR = validHRIRs.ToArray();
                 }
 
-                Pach_SP_HRTF.ApplySystemCompensation(Loaded_HRIR, Directions, Fs, 0, sysCompSettings, auto);
-                Pach_SP_HRTF.ShiftHRIRPairs(Loaded_HRIR, 0.8);
+                Pach_SP_HRTF.ApplySystemCompensation(Loaded_HRIR, Directions, targetFs, 0, sysCompSettings, auto);
             }
-
             public double[][] Binaural_IR(double _azi, double _alt)
             {
-                // Rotate the directional filters according to the given azimuth and elevation
-                double[][] rotatedDirectionalFilters = PachTools.Rotate_Vector_Rose(Loaded_Filter, -_azi, -_alt, true);
+                if (Loaded_Filter == null || Loaded_Filter.Length < 6)
+                    throw new InvalidOperationException("HRTF filters have not been loaded.");
 
-                List<double[]> directionalSignalsList = new List<double[]>();
+                int signalLength = Loaded_Filter.First(f => f != null).Length;
+                double[][] directionalSignals = new double[Directions.Length][];
+                for (int i = 0; i < directionalSignals.Length; i++)
+                    directionalSignals[i] = new double[signalLength];
 
-                // Build directional component signals from the rotated filters
-                for (int i = 0; i < Directions.Length; i++)
+                List<int> activeDirections = new List<int>();
+
+                Vector[] worldAxes = new Vector[]
                 {
-                    double[] directionalSignal = Pach_SP_HRTF.BuildDirectionalComponent(i, rotatedDirectionalFilters, Directions, Translation);
-                    directionalSignalsList.Add(directionalSignal);
+                    new Vector(1, 0, 0),
+                    new Vector(-1, 0, 0),
+                    new Vector(0, 1, 0),
+                    new Vector(0, -1, 0),
+                    new Vector(0, 0, 1),
+                    new Vector(0, 0, -1)
+                };
+
+                for (int axis = 0; axis < worldAxes.Length; axis++)
+                {
+                    Vector headDirection = PachTools.Rotate_Vector(worldAxes[axis], _azi, _alt, true);
+                    headDirection.Normalize();
+
+                    List<Pach_SP_HRTF.DirectionalGain> gains = Pach_SP_HRTF.VbapGains(headDirection, Directions);
+                    foreach (Pach_SP_HRTF.DirectionalGain gain in gains)
+                    {
+                        AddScaled(directionalSignals[gain.Index], Loaded_Filter[axis], gain.Gain);
+                        if (!activeDirections.Contains(gain.Index)) activeDirections.Add(gain.Index);
+                    }
                 }
 
-                double[][] directionalSignals = directionalSignalsList.ToArray();
-                double[] dryDirectionalSignal = Pach_SP_HRTF.BuildDrySignal(directionalSignals);
+                if (activeDirections.Count == 0)
+                    throw new InvalidOperationException("No active HRTF directions were selected for binaural rendering.");
+
+                double[][] activeDirectionalSignals = activeDirections.Select(idx => directionalSignals[idx]).ToArray();
+                double[] dryDirectionalSignal = Pach_SP_HRTF.BuildDrySignal(activeDirectionalSignals);
                 double dryRMS = Pach_SP_HRTF.ComputeRMS(dryDirectionalSignal);
 
-                // Convolve each directional signal with its corresponding HRIR
-                double[][][] convolvedSignals = new double[directionalSignals.Length][][];
-                for (int idx = 0; idx < directionalSignals.Length; idx++)
+                double[][][] convolvedSignals = new double[activeDirections.Count][][];
+                for (int i = 0; i < activeDirections.Count; i++)
                 {
-                    convolvedSignals[idx] = new double[2][];
-                    convolvedSignals[idx][0] = Pach_SP.FFT_Convolution_double(directionalSignals[idx], Loaded_HRIR[idx][0], 0);
-                    convolvedSignals[idx][1] = Pach_SP.FFT_Convolution_double(directionalSignals[idx], Loaded_HRIR[idx][1], 0);
+                    int idx = activeDirections[i];
+                    convolvedSignals[i] = new double[2][];
+                    convolvedSignals[i][0] = Pach_SP.FFT_Convolution_double(directionalSignals[idx], Loaded_HRIR[idx][0], 0);
+                    convolvedSignals[i][1] = Pach_SP.FFT_Convolution_double(directionalSignals[idx], Loaded_HRIR[idx][1], 0);
                 }
 
-                // Sum across directions to get the final binaural signal
                 double[][] Signal = Pach_SP_HRTF.SumAcrossDirections(convolvedSignals);
                 Pach_SP_HRTF.NormaliseStereoByDryRMS(Signal, dryRMS);
 
                 return Signal;
+            }
+        
+            private static void AddScaled(double[] destination, double[] source, double gain)
+            {
+                if (destination == null || source == null) return;
+                int length = Math.Min(destination.Length, source.Length);
+                for (int i = 0; i < length; i++)
+                    destination[i] += source[i] * gain;
             }
         }
     }
