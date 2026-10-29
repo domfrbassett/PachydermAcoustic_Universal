@@ -1507,7 +1507,6 @@ namespace Pachyderm_Acoustic
 
             /// <summary>
             /// Maps cos(incidence) to the Transfer_FunctionR/I index (index k covers incidence k*5 .. (k+1)*5 deg).
-            /// Previously the angle was divided by 18 rather than the 5 deg increment, so 0-90 deg only reached 27.5 deg.
             /// </summary>
             private int AngleIndex(double cosTheta)
             {
@@ -2531,7 +2530,6 @@ namespace Pachyderm_Acoustic
                     rec_order = requestedOrder;
 
                     // Fit the normal-incidence reflection (locally reacting FVM boundary).
-                    // Index 17 was 87.5 deg (grazing) because the angular splines are stored in reverse order.
                     int idx = NormalIncidenceIndex();
 
                     System.Numerics.Complex[] Rtarget = new System.Numerics.Complex[frequencies.Length];
