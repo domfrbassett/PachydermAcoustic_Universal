@@ -390,9 +390,9 @@ namespace Pachyderm_Acoustic
                         double mem = 0.0;
                         for (int i = 0; i < filters.Length; i++) mem += filters[i].g_b_term();
 
-                        // Boundary update:
-                        // Pnf = (0.25*p2 - Pn + (κ - 1)*Pn_1 + mem) / (1 + κ)
-                        Pnf = (0.25 * p2 - Pn + kappaMinus1 * Pn_1 + mem) * denom;
+                        // Pnf = (w*p2 + (2 - 12w)*Pn + (kappa - 1)*Pn_1 + mem) / (1 + kappa), w the link weight
+                        double w = Weight;
+                        Pnf = (w * p2 + (2 - 12 * w) * Pn + kappaMinus1 * Pn_1 + mem) * denom;
 
                         // Advance filter states
                         for (int i = 0; i < filters.Length; i++) filters[i].Update(Pnf, Pn_1);

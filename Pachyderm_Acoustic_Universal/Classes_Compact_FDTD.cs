@@ -188,7 +188,8 @@ namespace Pachyderm_Acoustic
                     Point MinPt = new Point(InnerMin.x - 2 * dx * no_of_Layers, InnerMin.y - 2 * dy * no_of_Layers, InnerMin.z - 2 * dz * no_of_Layers);
                     Bounds = new AABB(MinPt, MinPt + new Point(x_length, y_length, z_length));
 
-                    dt = dy * rt2 / (Rm.Sound_speed(0));                           //set time step small enough to satisfy courrant condition
+                    dt = Courant_Time_Step(dy, Rm.Sound_speed(0));                 //cT/h: 1/sqrt2 staircase, Cut_Cell_Courant with cut cells
+                    Set_Interior_Coupling(Rm.Sound_speed(0));
                     dxrt2 = dx * rt2;
                     dxrt3 = dx * rt3;
 
@@ -274,6 +275,7 @@ namespace Pachyderm_Acoustic
                     zDim = PFrame[0][0].Length;
 
                     for (int i = 0; i < Bound.Count; i++) if (Bound[i] != null) Bound[i].Complete_Boundary();
+                    Fit_Boundary_Cells();
                     if (failed) return;
 
                     //Set up PML...
@@ -341,7 +343,8 @@ namespace Pachyderm_Acoustic
                     Point MinPt = new Point(SampleOrigin.x - x_length / 2, SampleOrigin.y - y_length / 2, floorplaneoverride);
                     Bounds = new AABB(MinPt, MinPt + new Point(x_length, y_length, z_length));
 
-                    dt = dy * rt2 / (Rm.Sound_speed(0));                           //set time step small enough to satisfy courrant condition
+                    dt = Courant_Time_Step(dy, Rm.Sound_speed(0));                 //cT/h: 1/sqrt2 staircase, Cut_Cell_Courant with cut cells
+                    Set_Interior_Coupling(Rm.Sound_speed(0));
                     dxrt2 = dx * rt2;
                     dxrt3 = dx * rt3;
 
@@ -355,7 +358,8 @@ namespace Pachyderm_Acoustic
                     //zDim = (int)Math.Ceiling(z_length / dz);                                //set number of nodes in z direction
 
                     //estimated distance between nodes
-                    dt = dy * rt2 / (Rm.Sound_speed(0));                           //set time step small enough to satisfy courrant condition
+                    dt = Courant_Time_Step(dy, Rm.Sound_speed(0));                 //cT/h: 1/sqrt2 staircase, Cut_Cell_Courant with cut cells
+                    Set_Interior_Coupling(Rm.Sound_speed(0));
                     dxrt2 = dx * rt2;
                     dxrt3 = dx * rt3;
 
@@ -479,6 +483,7 @@ namespace Pachyderm_Acoustic
                     zDim = PFrame[0][0].Length;
 
                     for (int i = 0; i < Bound.Count; i++) if (Bound[i] != null) Bound[i].Complete_Boundary();
+                    Fit_Boundary_Cells();
                     if (failed) return;
 
                     //Set up PML...
@@ -493,7 +498,9 @@ namespace Pachyderm_Acoustic
                     double dydz = Rm.Sound_speed(0) / fmax * .1;
                     dx = 2 * dydz / Math.Sqrt(2);
 
-                    Bounds = new AABB(Rm.Min() - new Vector(.05 * dx, .05 * dydz, .05 * dydz), Rm.Max() + new Point(.05 * dx, .05 * dydz, .05 * dydz));
+                    // Cut cells: pad the grid so every cell that reaches into the model exists.
+                    double padX = Cut_Cells_Apply ? 3 * dx : .05 * dx, padYZ = Cut_Cells_Apply ? 4 * dydz : .05 * dydz;
+                    Bounds = new AABB(Rm.Min() - new Vector(padX, padYZ, padYZ), Rm.Max() + new Point(padX, padYZ, padYZ));
                     Bounds_Inner = new AABB(Bounds.Min_PT.x, Bounds.Min_PT.y, Bounds.Min_PT.z, Bounds.Max_PT.x, Bounds.Max_PT.y, Bounds.Max_PT.z);
 
                     no_of_Layers = 0;
@@ -535,7 +542,8 @@ namespace Pachyderm_Acoustic
                     zDim = (int)Math.Ceiling(z_length / dydz);                                //set number of nodes in z direction
                     dz = z_length / zDim;
 
-                    dt = dy * rt2 / (Rm.Sound_speed(0));                           //set time step small enough to satisfy courrant condition
+                    dt = Courant_Time_Step(dy, Rm.Sound_speed(0));                 //cT/h: 1/sqrt2 staircase, Cut_Cell_Courant with cut cells
+                    Set_Interior_Coupling(Rm.Sound_speed(0));
                     dxrt2 = dx * rt2;
                     dxrt3 = dx * rt3;
 
@@ -586,7 +594,8 @@ namespace Pachyderm_Acoustic
                                 List<Environment.Material> abs;
                                 List<Bound_Node.Boundary> BDir;
                                 Point Loc = Acoustic_Compact_FDTD.RDD_Location(MinPt, x, y, z, dx, dy, dz); //new Point(MinPt.x + 2 * (((double)x - 0.5) * dx), MinPt.y + 2 * (((double)y + (0.5 - 0.5 * mod)) * dy), MinPt.z + 2 * (((double)z + (0.5 - 0.5 * mod)) * dz));
-                                if (!Intersect_13Pt(Loc, SD.frequency, out BDir, out abs, out List<double> faceWeights, ref Rnd))
+                                // Cut cells replace the staircase boundary classification.
+                                if (Cut_Cells_Apply || !Intersect_13Pt(Loc, SD.frequency, out BDir, out abs, out List<double> faceWeights, ref Rnd))
                                 {
                                     PFrame[x][y][z] = new RDD_Node(Loc);//, rho0, dt, dx, Rm.Sound_speed, new int[] { x, y, z });
                                 }
@@ -618,6 +627,7 @@ namespace Pachyderm_Acoustic
                     zDim = PFrame[0][0].Length;
 
                     for (int i = 0; i < Bound.Count; i++) if (Bound[i] != null) Bound[i].Complete_Boundary();
+                    Fit_Boundary_Cells();
                     if (failed) return;
 
                     //Set up PML...
@@ -1227,7 +1237,7 @@ namespace Pachyderm_Acoustic
                         Pn = Pnf * Attenuation;
                     }
 
-                    public void reset()
+                    public virtual void reset()
                     {
                         Pnf = 0; Pn = 0; Pn_1 = 0;
                     }
@@ -1478,11 +1488,17 @@ namespace Pachyderm_Acoustic
                         //foreach (Node n in Links2) Rhino.RhinoDoc.ActiveDoc.Objects.AddLine(Utilities.PachTools.HPttoRPt(Pt), Utilities.PachTools.HPttoRPt(n.Pt));
                     }
 
+                    /// <summary>Interior link weight, (cT/h)^2 / 2. Set before nodes are created.</summary>
+                    public static double Coupling = 0.25;
+
+                    /// <summary>The link weight this node was built with.</summary>
+                    public readonly double Weight = Coupling;
+
                     public override void UpdateP()
                     {
                         double p2 = 0;
                         foreach (Node node in Links2) p2 += node.P;
-                        Pnf = p2 * 0.25 - Pn - Pn_1;
+                        Pnf = p2 * Weight + (2 - 12 * Weight) * Pn - Pn_1;
                     }
                 }
 
@@ -2052,6 +2068,8 @@ namespace Pachyderm_Acoustic
                 public void Drive(int t)
                 {
                     t += delayshortcut;
+                    // A merged source node is driven through its group's node.
+                    for (int i = 0; i < SrcNode.Count; i++) if (SrcNode[i] is Slave_Node slave) SrcNode[i] = slave.Master;
                     for (int i = 0; i < SrcNode.Count; i++)
                     {
                         if (t < signal[0].Length + delays[i])
