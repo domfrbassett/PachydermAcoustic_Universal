@@ -123,8 +123,8 @@ namespace Pachyderm_Acoustic
                     if (GT == GridType.Freefield)
                     {
                         Build_Freefield_FVM13(ref xDim, ref yDim, ref zDim, PML, mindimx, mindimy, mindimz);
-                        SD.Connect_Grid_Freefield(PFrame, Bounds, dx, dy, dz, tmax, dt, no_of_Layers);
-                        Mic.Connect_Grid_UniqueOnly_Freefield(PFrame, Bounds, dx, tmax, dt, no_of_Layers);
+                        SD.Connect_Grid_Freefield(PFrame, Bounds, dx, dy, dz, tmax, dt, no_of_Layers, Rm.Sound_speed(0), Rm.Rho_C(0));
+                        Mic.Connect_Grid_UniqueOnly_Freefield(PFrame, Bounds, dx, tmax, dt, no_of_Layers, dy, dz);
                     }
                     else if (GT == GridType.ScatteringLab)
                     {
@@ -1593,6 +1593,7 @@ namespace Pachyderm_Acoustic
                 double dt;
                 public List<int> delays;
                 public int delayshortcut = 0;
+                double nodeVolume, soundSpeed = 343, rhoC = 413;
 
                 public enum Signal_Type
                 {
@@ -1632,10 +1633,13 @@ namespace Pachyderm_Acoustic
                     }
                 }
 
-                public void Connect_Grid_Freefield(Acoustic_Compact_FDTD.Node[][][] Frame, AABB Bounds, double dx, double dy, double dz, double _tmax, double _dt, int no_of_Layers)
+                public void Connect_Grid_Freefield(Acoustic_Compact_FDTD.Node[][][] Frame, AABB Bounds, double dx, double dy, double dz, double _tmax, double _dt, int no_of_Layers, double c = 343, double rho_c = 413)
                 {
                     tmax = _tmax / 1000;
                     dt = _dt;
+                    nodeVolume = 4 * dx * dy * dz;
+                    soundSpeed = c;
+                    rhoC = rho_c;
 
                     SrcNode = new List<Acoustic_Compact_FDTD.Node>();
                     X = new List<int>();
@@ -1672,6 +1676,7 @@ namespace Pachyderm_Acoustic
                 {
                     tmax = _tmax / 1000;
                     dt = _dt;
+                    nodeVolume = 4 * dx * dy * dz;
 
                     SrcNode = new List<Acoustic_Compact_FDTD.Node>();
                     X = new List<int>();
@@ -2008,39 +2013,47 @@ namespace Pachyderm_Acoustic
                                 }
                                 break;
                             case Signal_Type.Sinc_Function:
-                                int sincLen = (int)Math.Ceiling(tmax / dt)/5;
-                                signal[i] = new double[sincLen];
-                                double t0_ = (sincLen - 1) * 0.5 * dt;
-
-                                for (int oct = -1; oct < 8; oct++)
                                 {
-                                    double ctr = 62.5 * Math.Pow(2, oct);
-                                    double fl = ctr / Utilities.Numerics.rt2;
-                                    double fu = ctr * Utilities.Numerics.rt2;
-
-                                    if (fl > frequency) break;
-
-                                    double bw = fu - fl;
-                                    double fc = (fl + fu) * 0.5;
-
-                                    double[] band = new double[sincLen];
-                                    double bandEnergy = 0;
-
+                                    int sincLen = 2 * (int)Math.Ceiling(0.5 * SincLength / dt) + 1;
+                                    signal[i] = new double[sincLen];
+                                    double t0_ = (sincLen - 1) * 0.5 * dt;
+                                    double[] window = new double[sincLen];
+                                    double wsum = 0;
                                     for (int n = 0; n < sincLen; n++)
                                     {
-                                        double t = n * dt - t0_;
-                                        double sinc = (Math.Abs(t) < 1e-30) ? 1.0 : Math.Sin(Math.PI * bw * t) / (Math.PI * bw * t);
-                                        double window = Math.Pow(0.5 * (1.0 - Math.Cos(2.0 * Math.PI * n / (sincLen - 1))), 3);
-                                        band[n] = sinc * Math.Cos(2 * Math.PI * fc * t) * window;
-                                        bandEnergy += band[n] * band[n];
+                                        window[n] = Math.Pow(0.5 * (1.0 - Math.Cos(2.0 * Math.PI * n / (sincLen - 1))), 3);
+                                        wsum += window[n];
                                     }
 
-                                    double rmsScale = (bandEnergy > 0) ? rms_p[i][(int)Math.Max(0,oct)] * tmax * 256 * 400 * 400 / Math.Sqrt(bandEnergy) : 0;
+                                    // A soft source radiates p(r, t) = V s(t - r/c) / (4 pi r c^2 dt^2), V the volume per node.
+                                    // Bands are scaled to Pachyderm's pressure response: |sum over 44.1 kHz samples of p e^(-iwt)| = sqrt(rho c W / (4 pi r^2)).
+                                    double gain = Math.Sqrt(4 * Math.PI * rhoC) * soundSpeed * soundSpeed * dt * dt / (nodeVolume * 44100);
 
-                                    for (int n = 0; n < sincLen; n++)
+                                    for (int oct = -1; oct < 8; oct++)
                                     {
-                                        signal[i][n] += band[n] * rmsScale;
+                                        double ctr = 62.5 * Math.Pow(2, oct);
+                                        double fl = ctr / Utilities.Numerics.rt2;
+                                        double fu = ctr * Utilities.Numerics.rt2;
+
+                                        if (fl > frequency) break;
+
+                                        double bw = fu - fl;
+                                        double fc = (fl + fu) * 0.5;
+                                        double A = 2 * bw * gain * Math.Sqrt(SWL[i][Math.Max(0, oct)]);
+
+                                        for (int n = 0; n < sincLen; n++)
+                                        {
+                                            double t = n * dt - t0_;
+                                            double sinc = (Math.Abs(t) < 1e-30) ? 1.0 : Math.Sin(Math.PI * bw * t) / (Math.PI * bw * t);
+                                            signal[i][n] += A * sinc * Math.Cos(2 * Math.PI * fc * t) * window[n];
+                                        }
                                     }
+
+                                    // No net volume injected: zero mean, symmetric about the centre.
+                                    double dc = 0;
+                                    for (int n = 0; n < sincLen; n++) dc += signal[i][n];
+                                    dc /= wsum;
+                                    for (int n = 0; n < sincLen; n++) signal[i][n] -= dc * window[n];
                                 }
                                 break;
                             case Signal_Type.SteadyState_Noise:
@@ -2070,6 +2083,12 @@ namespace Pachyderm_Acoustic
                     t += delayshortcut;
                     // A merged source node is driven through its group's node.
                     for (int i = 0; i < SrcNode.Count; i++) if (SrcNode[i] is Slave_Node slave) SrcNode[i] = slave.Master;
+                    if (S == Signal_Type.Sinc_Function)
+                    {
+                        // Soft source: added to the updated pressure, transparent to incoming sound.
+                        for (int i = 0; i < SrcNode.Count; i++) if (t < signal[i].Length) SrcNode[i].Pn += signal[i][t];
+                        return;
+                    }
                     for (int i = 0; i < SrcNode.Count; i++)
                     {
                         if (t < signal[0].Length + delays[i])
@@ -2097,6 +2116,53 @@ namespace Pachyderm_Acoustic
                     double[] signal_clone = new double[length];
                     Array.Copy(signal, signal_clone, signal.Length);
                     return Audio.Pach_SP.FFT_General(signal_clone, 0);
+                }
+
+                /// <summary>Length of the Sinc_Function pulse (s).</summary>
+                public const double SincLength = 0.2;
+
+                /// <summary>Time from the start of the simulation to the centre of the Sinc_Function pulse (s).</summary>
+                public double Pulse_Delay
+                {
+                    get { return S == Signal_Type.Sinc_Function && signal != null && signal.Length > 0 ? (signal[0].Length - 1) * 0.5 * dt : 0; }
+                }
+
+                /// <summary>Impulse response from a Sinc_Function recording, starting at emission, with the pulse's band-limiting made minimum phase.</summary>
+                public double[] Impulse_Response(double[] recording, int source = 0)
+                {
+                    if (S != Signal_Type.Sinc_Function || signal == null || recording == null || recording.Length == 0) return recording;
+                    double[] s = signal[Math.Min(source, signal.Length - 1)];
+                    int N = 1;
+                    while (N < 4 * Math.Max(recording.Length, s.Length)) N <<= 1;
+
+                    System.Numerics.Complex[] R = new System.Numerics.Complex[N];
+                    System.Numerics.Complex[] Sp = new System.Numerics.Complex[N];
+                    for (int i = 0; i < recording.Length; i++) R[i] = recording[i];
+                    for (int i = 0; i < s.Length; i++) Sp[i] = s[i];
+                    MathNet.Numerics.IntegralTransforms.Fourier.Forward(R, MathNet.Numerics.IntegralTransforms.FourierOptions.Matlab);
+                    MathNet.Numerics.IntegralTransforms.Fourier.Forward(Sp, MathNet.Numerics.IntegralTransforms.FourierOptions.Matlab);
+
+                    double max = 0;
+                    for (int i = 0; i < N; i++) max = Math.Max(max, Sp[i].Magnitude);
+                    double floor = max * 1E-6;
+
+                    // Minimum phase spectrum with the pulse's magnitude, by the folded real cepstrum.
+                    System.Numerics.Complex[] C = new System.Numerics.Complex[N];
+                    for (int i = 0; i < N; i++) C[i] = Math.Log(Math.Max(Sp[i].Magnitude, floor));
+                    MathNet.Numerics.IntegralTransforms.Fourier.Inverse(C, MathNet.Numerics.IntegralTransforms.FourierOptions.Matlab);
+                    for (int i = 1; i < N / 2; i++) { C[i] *= 2; C[N - i] = 0; }
+                    MathNet.Numerics.IntegralTransforms.Fourier.Forward(C, MathNet.Numerics.IntegralTransforms.FourierOptions.Matlab);
+
+                    for (int i = 0; i < N; i++)
+                    {
+                        double m = Sp[i].Magnitude;
+                        R[i] = m > floor * 100 ? R[i] * System.Numerics.Complex.Exp(C[i]) / Sp[i] : System.Numerics.Complex.Zero;
+                    }
+                    MathNet.Numerics.IntegralTransforms.Fourier.Inverse(R, MathNet.Numerics.IntegralTransforms.FourierOptions.Matlab);
+
+                    double[] h = new double[recording.Length];
+                    for (int i = 0; i < h.Length; i++) h[i] = R[i].Real;
+                    return h;
                 }
 
                 public double frequency
@@ -2182,40 +2248,29 @@ namespace Pachyderm_Acoustic
                     }
                 }
 
-                public void Connect_Grid_UniqueOnly_Freefield(Acoustic_Compact_FDTD.Node[][][] Frame, AABB Bounds, double dx, double _tmax, double dt, int no_of_Layers)
+                public void Connect_Grid_UniqueOnly_Freefield(Acoustic_Compact_FDTD.Node[][][] Frame, AABB Bounds, double dx, double _tmax, double dt, int no_of_Layers, double dy = 0, double dz = 0)
                 {
                     no_of_samples = (int)Math.Ceiling(_tmax / dt / 1000);
                     tmax = _tmax;
+                    if (dy <= 0) dy = dx / Utilities.Numerics.rt2;
+                    if (dz <= 0) dz = dx / Utilities.Numerics.rt2;
 
-                    bool[,,] Check_Frame = new bool[Frame.Length, Frame[0].Length, Frame[0][0].Length];
-                    List<Acoustic_Compact_FDTD.Node> Rec_Unique = new List<Acoustic_Compact_FDTD.Node>();
+                    // One recording per receiver, at its nearest node.
                     X = new int[Loc.Length];
                     Y = new int[Loc.Length];
                     Z = new int[Loc.Length];
-
-                    int j = 0;
+                    RecNode = new Acoustic_Compact_FDTD.Node[Loc.Length];
                     for (int i = 0; i < Loc.Length; i++)
                     {
-                        int x = (int)Math.Floor((Loc[i].x - Bounds.Min_PT.x) / (dx));// + (int)(no_of_Layers) / Utilities.Numerics.rt2);
-                        int y = (int)Math.Floor((Loc[i].y - Bounds.Min_PT.y) / (dx * Utilities.Numerics.rt2));// + no_of_Layers / 2;
-                        int z = (int)Math.Floor((Loc[i].z - Bounds.Min_PT.z) / (dx * Utilities.Numerics.rt2));// + no_of_Layers / 2;
-                        //Rhino.RhinoDoc.ActiveDoc.Objects.AddPoint(Utilities.PachTools.HPttoRPt(Acoustic_Compact_FDTD.RDD_Location(Bounds.Min_PT, X, Y, Z, dx, dx * Utilities.Numerics.rt2, dx * Utilities.Numerics.rt2)));
-                        if (!Check_Frame[x, y, z])
-                        {
-                            X[j] = x; Y[j] = y; Z[j] = z;
-                            j++;
-                            Check_Frame[X[i], Y[i], Z[i]] = true;
-                            Rec_Unique.Add(Frame[X[i]][Y[i]][Z[i]]);
-                        }
+                        int[] n = Acoustic_Compact_FDTD.RDD_Location(Bounds.Min_PT, Loc[i], dx, dy, dz);
+                        X[i] = Math.Max(0, Math.Min(Frame.Length - 1, n[0]));
+                        Y[i] = Math.Max(0, Math.Min(Frame[X[i]].Length - 1, n[1]));
+                        Z[i] = Math.Max(0, Math.Min(Frame[X[i]][Y[i]].Length - 1, n[2]));
+                        RecNode[i] = Frame[X[i]][Y[i]][Z[i]];
                     }
-                    Array.Resize(ref X, j);
-                    Array.Resize(ref Y, j);
-                    Array.Resize(ref Z, j);
 
-                    recording = new double[Rec_Unique.Count][];
+                    recording = new double[Loc.Length][];
                     for (int i = 0; i < recording.Length; i++) recording[i] = new double[no_of_samples];
-
-                    RecNode = Rec_Unique.ToArray();
                 }
 
                 //public void Connect_Grid_UniqueOnly_Laboratory(Acoustic_Compact_FDTD.Node[][][] Frame, AABB Bounds, double dx, double _tmax, double dt, int no_of_Layers)
